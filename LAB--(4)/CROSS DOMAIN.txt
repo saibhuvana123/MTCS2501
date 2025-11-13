@@ -1,0 +1,155 @@
+import re
+import numpy as np
+import scipy.sparse as sp
+from collections import Counter
+from sklearn.decomposition import TruncatedSVD
+from sklearn.svm import LinearSVC
+from sklearn.metrics import accuracy_score, f1_score, classification_report
+from datasets import load_dataset
+import warnings
+warnings.filterwarnings("ignore")
+
+
+def simple_tokenize(text):
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9'\s]", " ", text)
+    return [t for t in text.split() if len(t) > 1]
+
+def preprocess_corpus(corpus):
+    return [simple_tokenize(doc) for doc in corpus]
+
+
+def build_vocabulary(tokenized_source, tokenized_target):
+    src_counts = Counter([w for doc in tokenized_source for w in doc])
+    tgt_counts = Counter([w for doc in tokenized_target for w in doc])
+    vocab = set(src_counts.keys()) | set(tgt_counts.keys())
+    return src_counts, tgt_counts, vocab
+
+def split_domain_words(src_counts, tgt_counts, vocab, min_freq=5, ratio_thresh=5.0):
+    domain_indep, src_spec, tgt_spec = set(), set(), set()
+    for w in vocab:
+        f_src, f_tgt = src_counts.get(w, 0), tgt_counts.get(w, 0)
+        total = f_src + f_tgt
+        if total < min_freq:
+            continue
+        if f_src > 0 and f_tgt > 0:
+            ratio = (f_src + 1) / (f_tgt + 1)
+            if 1/ratio_thresh <= ratio <= ratio_thresh:
+                domain_indep.add(w)
+            elif ratio > ratio_thresh:
+                src_spec.add(w)
+            else:
+                tgt_spec.add(w)
+        else:
+            if f_src > 0:
+                src_spec.add(w)
+            else:
+                tgt_spec.add(w)
+    return domain_indep, src_spec, tgt_spec
+
+
+def build_cooccurrence_matrix(tokenized_docs, specific_words, independent_words, window_size=5):
+    spec_list = sorted(specific_words)
+    indep_list = sorted(independent_words)
+    spec_index = {w:i for i,w in enumerate(spec_list)}
+    indep_index = {w:i for i,w in enumerate(indep_list)}
+    rows, cols, data = [], [], []
+
+    for doc in tokenized_docs:
+        n = len(doc)
+        for i, w in enumerate(doc):
+            if w in spec_index:
+                left, right = max(0, i-window_size), min(n, i+window_size+1)
+                for u in doc[left:right]:
+                    if u in indep_index:
+                        rows.append(spec_index[w])
+                        cols.append(indep_index[u])
+                        data.append(1)
+    M = sp.csr_matrix((data, (rows, cols)), shape=(len(spec_list), len(indep_list)))
+    return M, spec_list, indep_list
+
+def spectral_feature_alignment(M, n_components=100):
+    if M.shape[0] == 0 or M.shape[1] == 0:
+        return np.zeros((M.shape[0], n_components))
+    svd = TruncatedSVD(n_components=min(n_components, min(M.shape)-1 or 1), random_state=42)
+    W = svd.fit_transform(M)
+    W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-8
+    return W
+
+def build_word_embeddings(spec_list, indep_list, W_spec, M):
+    M_dense = M.toarray() if M.nnz > 0 else np.zeros((len(spec_list), len(indep_list)))
+    indep_emb = {}
+    for j, w in enumerate(indep_list):
+        weights = M_dense[:, j:j+1]
+        if weights.sum() == 0:
+            emb = np.zeros(W_spec.shape[1])
+        else:
+            emb = (W_spec * weights).sum(axis=0) / (weights.sum())
+        indep_emb[w] = emb
+    spec_emb = {w: W_spec[i,:] for i,w in enumerate(spec_list)}
+    return spec_emb, indep_emb
+
+def doc_to_vector(tokens, spec_emb, indep_emb, dim=50):
+    vecs = [spec_emb[w] for w in tokens if w in spec_emb] + \
+           [indep_emb[w] for w in tokens if w in indep_emb]
+    if not vecs:
+        return np.zeros(dim)
+    return np.mean(vecs, axis=0)
+
+
+def run_sfa(source_texts, source_labels, target_texts, target_labels,
+            min_freq=5, svd_dims=100, sample_size=5000):
+    print("Preprocessing...")
+    tok_src = preprocess_corpus(source_texts[:sample_size])
+    tok_tgt = preprocess_corpus(target_texts[:sample_size])
+    src_labels = np.array(source_labels[:sample_size])
+    tgt_labels = np.array(target_labels[:sample_size])
+
+    src_counts, tgt_counts, vocab = build_vocabulary(tok_src, tok_tgt)
+    domain_indep, src_spec, tgt_spec = split_domain_words(src_counts, tgt_counts, vocab, min_freq)
+
+    print(f"Domain-independent: {len(domain_indep)}, Source-specific: {len(src_spec)}, Target-specific: {len(tgt_spec)}")
+
+    all_docs = tok_src + tok_tgt
+    M_src, src_spec_list, indep_list = build_cooccurrence_matrix(all_docs, src_spec, domain_indep)
+    M_tgt, tgt_spec_list, _ = build_cooccurrence_matrix(all_docs, tgt_spec, domain_indep)
+
+    M_combined = sp.vstack([M_src, M_tgt])
+    print(f"Performing SVD on matrix {M_combined.shape}...")
+    W = spectral_feature_alignment(M_combined, n_components=svd_dims)
+    ns = M_src.shape[0]
+    W_src, W_tgt = W[:ns,:], W[ns:,:]
+
+    spec_emb_src, indep_emb = build_word_embeddings(src_spec_list, indep_list, W_src, M_src)
+    spec_emb_tgt, _ = build_word_embeddings(tgt_spec_list, indep_list, W_tgt, M_tgt)
+    spec_emb = {**spec_emb_src, **spec_emb_tgt}
+
+    dim = W.shape[1]
+    X_src = np.vstack([doc_to_vector(doc, spec_emb, indep_emb, dim) for doc in tok_src])
+    X_tgt = np.vstack([doc_to_vector(doc, spec_emb, indep_emb, dim) for doc in tok_tgt])
+
+    print("Training classifier...")
+    clf = LinearSVC(random_state=42, max_iter=5000)
+    clf.fit(X_src, src_labels)
+    y_pred = clf.predict(X_tgt)
+
+    print("\n=== Evaluation on Target Domain ===")
+    print(f"Accuracy: {accuracy_score(tgt_labels, y_pred):.4f}")
+    print(f"Macro-F1: {f1_score(tgt_labels, y_pred, average='macro'):.4f}")
+    print(classification_report(tgt_labels, y_pred))
+    return clf
+
+
+print("Downloading datasets (Amazon & Yelp)...")
+
+amazon_ds = load_dataset("amazon_polarity", split="train[:5000]")
+yelp_ds = load_dataset("yelp_polarity", split="train[:5000]")
+
+source_texts = [ex["content"] for ex in amazon_ds]
+source_labels = [ex["label"] for ex in amazon_ds]
+
+target_texts = [ex["text"] for ex in yelp_ds]
+target_labels = [ex["label"] for ex in yelp_ds]
+
+print("Running SFA on Amazon → Yelp...")
+run_sfa(source_texts, source_labels, target_texts, target_labels, min_freq=3, svd_dims=50, sample_size=2000)
