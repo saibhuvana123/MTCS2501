@@ -1,0 +1,94 @@
+
+import numpy as np
+import random
+from sklearn.feature_extraction.text import CountVectorizer
+from datasets import load_dataset
+
+
+print("Loading Yelp dataset...")
+dataset = load_dataset("yelp_review_full", split="train[:2%]")  # Use small subset for speed
+texts = dataset["text"]
+labels = dataset["label"]  
+
+
+sentiments = ["Negative" if l < 2 else "Positive" for l in labels]
+
+
+print("Vectorizing text...")
+vectorizer = CountVectorizer(max_features=1000, stop_words='english')
+X = vectorizer.fit_transform(texts)
+vocab = vectorizer.get_feature_names_out()
+
+
+n_docs, n_words = X.shape
+n_topics = 100        
+alpha = 0.1           
+beta = 0.1            
+n_iters = 20          
+
+
+word_indices = [X[i].nonzero()[1] for i in range(n_docs)]
+z = [np.random.randint(0, n_topics, len(wi)) for wi in word_indices]
+
+doc_topic = np.zeros((n_docs, n_topics)) + alpha
+topic_word = np.zeros((n_topics, n_words)) + beta
+topic_count = np.zeros(n_topics) + n_words * beta
+
+
+for d, wi in enumerate(word_indices):
+    for i, w in enumerate(wi):
+        topic = z[d][i]
+        doc_topic[d, topic] += 1
+        topic_word[topic, w] += 1
+        topic_count[topic] += 1
+
+
+print(f"Running Gibbs Sampling for {n_topics} topics...")
+for it in range(n_iters):
+    for d, wi in enumerate(word_indices):
+        for i, w in enumerate(wi):
+            topic = z[d][i]
+
+            
+            doc_topic[d, topic] -= 1
+            topic_word[topic, w] -= 1
+            topic_count[topic] -= 1
+
+            
+            p_z = (topic_word[:, w] / topic_count) * doc_topic[d, :]
+            p_z /= np.sum(p_z)
+
+            
+            new_topic = np.random.choice(np.arange(n_topics), p=p_z)
+
+            
+            z[d][i] = new_topic
+            doc_topic[d, new_topic] += 1
+            topic_word[new_topic, w] += 1
+            topic_count[new_topic] += 1
+
+    print(f"Iteration {it+1}/{n_iters} complete")
+
+print(f"\n✅ Gibbs sampling complete for {n_topics} topics!")
+
+
+
+positive_words = {"good", "great", "amazing", "love", "excellent", "awesome", "nice", "fantastic"}
+negative_words = {"bad", "worst", "terrible", "poor", "awful", "boring", "disappointing"}
+
+pred_sentiments = []
+for d, wi in enumerate(word_indices):
+    doc_words = vocab[wi]
+    pos = sum(w in positive_words for w in doc_words)
+    neg = sum(w in negative_words for w in doc_words)
+    pred_sentiments.append("Positive" if pos >= neg else "Negative")
+
+
+correct = sum(p == t for p, t in zip(pred_sentiments, sentiments))
+accuracy = correct / len(sentiments)
+
+print(f"\nModel Accuracy (approx): {accuracy:.2f}")
+print("\nSample Results:\n")
+for i in range(5):
+    print(f"Review: {texts[i][:80]}...")
+    print(f"→ True: {sentiments[i]} | Predicted: {pred_sentiments[i]}\n")
